@@ -83,7 +83,7 @@ def get_defensive_pressure_data(player_play_df, passing_plays):
         (player_play_df['gameId'].isin(passing_plays['gameId'])) &
         (player_play_df['playId'].isin(passing_plays['playId']))
     ][['gameId', 'playId', 'nflId', 'causedPressure', 
-       'timeToPressureAsPassRusher', 'getOffAsPassRusher']].copy()
+       'timeToPressureAsPassRusher', 'getOffTimeAsPassRusher']].copy()
     
     print(f"\nPressure events found: {pressure_data['causedPressure'].sum()}")
     return pressure_data
