@@ -276,7 +276,7 @@ def plot_alignment_insights(play_summary):
 def main():
     # Load and process all data
     print("Loading tracking data...")
-    tracking_df = load_tracking_data(weeks=[1])  # Start with week 1
+    tracking_df = load_tracking_data()  # Start with week 1
     
     print("\nLoading static data...")
     static_data = load_static_data()
