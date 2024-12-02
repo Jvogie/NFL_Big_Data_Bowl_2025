@@ -147,6 +147,146 @@ def analyze_defensive_alignment(pre_snap_data, pressure_data, plays_df, players_
     
     return play_summary, defensive_alignments
 
+def analyze_football_data(defensive_alignments):
+    """Analyze availability of football tracking data."""
+    print("\nFootball Data Analysis:")
+    
+    # Basic data checks
+    print("\nChecking for football in data:")
+    print(f"Values in displayName column: {defensive_alignments['displayName'].unique()}")
+    
+    # Get football data
+    football_data = defensive_alignments[defensive_alignments['displayName'] == 'football']
+    print(f"\nTotal football data rows: {len(football_data)}")
+    
+    # Count plays
+    total_plays = defensive_alignments['playId'].nunique()
+    plays_with_football = football_data['playId'].nunique()
+    
+    print(f"\nSummary:")
+    print(f"Total unique plays: {total_plays}")
+    print(f"Plays with football data: {plays_with_football}")
+    print(f"Percentage of plays with football: {(plays_with_football/total_plays)*100:.2f}%")
+    
+    # Sample of football data
+    print("\nSample of football tracking data:")
+    sample_play = football_data.groupby('playId').first().sample(n=1, random_state=42).index[0]
+    sample_data = football_data[football_data['playId'] == sample_play].sort_values('frameId')
+    print(f"\nPlay ID: {sample_play}")
+    print(sample_data[['frameId', 'frameType', 'x', 'y', 'event']].head())
+    
+    return plays_with_football, football_data
+
+def create_oline_features(defensive_alignments, play_summary, plays_df):
+    """Create features based on defensive alignment relative to ball position."""
+    def calculate_oline_matchups(group):
+        """Calculate defensive alignment features for a single play using ball position."""
+        # Check for football position
+        football_data = group[group['displayName'] == 'football']
+        if len(football_data) == 0:
+            # Use field center as fallback
+            ball_position = 26.65
+        else:
+            ball_position = football_data['y'].iloc[0]
+        
+        # Only look at defenders
+        defenders = group[
+            (group['displayName'] != 'football') & 
+            (group['distance_from_los'].abs() <= 3)
+        ]
+        
+        if len(defenders) == 0:
+            # Return default values if no defenders
+            return pd.Series({
+                'defenders_over_LT': 0,
+                'defenders_over_LG': 0,
+                'defenders_over_C': 0,
+                'defenders_over_RG': 0,
+                'defenders_over_RT': 0,
+                'closest_defender_to_LT': 3,
+                'closest_defender_to_LG': 3,
+                'closest_defender_to_C': 3,
+                'closest_defender_to_RG': 3,
+                'closest_defender_to_RT': 3,
+                'defenders_in_A_gap_left': 0,
+                'defenders_in_A_gap_right': 0,
+                'defenders_in_B_gap_left': 0,
+                'defenders_in_B_gap_right': 0,
+                'closest_defender_in_A_gap_left': 3,
+                'closest_defender_in_A_gap_right': 3,
+                'closest_defender_in_B_gap_left': 3,
+                'closest_defender_in_B_gap_right': 3,
+                'defensive_line_balance': 0,
+                'overloaded_side': 0,
+                'defenders_head_up': 0,
+                'wide_defenders_left': 0,
+                'wide_defenders_right': 0
+            })
+        
+        # Define O-line positions relative to ball position
+        oline_positions = {
+            'LT': ball_position - 4,
+            'LG': ball_position - 2,
+            'C': ball_position,
+            'RG': ball_position + 2,
+            'RT': ball_position + 4
+        }
+        
+        features = {}
+        
+        # Calculate features
+        for position, y_coord in oline_positions.items():
+            position_defenders = defenders[
+                (defenders['y'] >= y_coord - 1) & 
+                (defenders['y'] <= y_coord + 1)
+            ]
+            
+            features[f'defenders_over_{position}'] = len(position_defenders)
+            features[f'closest_defender_to_{position}'] = (
+                position_defenders['distance_from_los'].abs().min() 
+                if len(position_defenders) > 0 else 3
+            )
+        
+        # Add gap features
+        gaps = {
+            'A_gap_left': (oline_positions['C'], oline_positions['LG']),
+            'A_gap_right': (oline_positions['C'], oline_positions['RG']),
+            'B_gap_left': (oline_positions['LG'], oline_positions['LT']),
+            'B_gap_right': (oline_positions['RG'], oline_positions['RT'])
+        }
+        
+        for gap_name, (pos1, pos2) in gaps.items():
+            gap_defenders = defenders[
+                (defenders['y'] >= min(pos1, pos2)) & 
+                (defenders['y'] <= max(pos1, pos2))
+            ]
+            
+            features[f'defenders_in_{gap_name}'] = len(gap_defenders)
+            features[f'closest_defender_in_{gap_name}'] = (
+                gap_defenders['distance_from_los'].abs().min() 
+                if len(gap_defenders) > 0 else 3
+            )
+        
+        # Additional features
+        features.update({
+            'defensive_line_balance': abs(
+                sum(defenders['y'] < ball_position) - 
+                sum(defenders['y'] > ball_position)
+            ),
+            'overloaded_side': max(
+                sum(defenders['y'] < ball_position),
+                sum(defenders['y'] > ball_position)
+            ),
+            'defenders_head_up': sum(abs(defenders['y'] - ball_position) <= 0.5),
+            'wide_defenders_left': sum(defenders['y'] <= ball_position - 8),
+            'wide_defenders_right': sum(defenders['y'] >= ball_position + 8)
+        })
+        
+        return pd.Series(features)
+    
+    # Group by play and calculate features
+    return defensive_alignments.groupby(['gameId', 'playId']).apply(calculate_oline_matchups).reset_index()
+
 def create_basic_pressure_features(defensive_alignments, play_summary, plays_df):
     """Create basic features for pressure prediction with proper categorical handling."""
     # Group defensive alignments by play
@@ -189,70 +329,149 @@ def create_basic_pressure_features(defensive_alignments, play_summary, plays_df)
     return play_features
 
 def create_enhanced_pressure_features(defensive_alignments, play_summary, plays_df, player_play_df):
-    """Create enhanced features for pressure prediction with proper categorical handling."""
-    # Original positioning features
-    play_features = defensive_alignments.groupby(['gameId', 'playId']).agg({
-        'distance_from_los': ['mean', 'std', 'min', 'max'],
-        'y': ['mean', 'std', 'min', 'max'],
-        'in_box': 'sum'
-    }).reset_index()
+    """Create enhanced features for pressure prediction."""
+
+    print("\nAnalyzing football tracking data availability...")
+    plays_with_football, plays_missing_football = analyze_football_data(defensive_alignments)
     
-    # Flatten multi-level columns first
-    play_features.columns = ['gameId', 'playId', 
-                           'avg_depth', 'depth_std', 'closest_defender', 'deepest_defender',
-                           'avg_width', 'width_std', 'left_most', 'right_most',
-                           'box_defenders']
+    def calculate_box_features(group):
+        """Calculate box features relative to ball position."""
+        # Check for football position
+        football_data = group[group['displayName'] == 'football']
+        if len(football_data) == 0:
+            # print(f"Warning: No football found for gameId={group['gameId'].iloc[0]}, playId={group['playId'].iloc[0]}")
+            # Use middle of field as fallback
+            ball_position = 26.65
+        else:
+            ball_position = football_data['y'].iloc[0]
+
+        # Get only defensive players (exclude football)
+        defenders = group[group['displayName'] != 'football']
+        
+        # Define box dimensions
+        box_width = 8  # yards total (4 yards each side of ball)
+        box_depth = 5  # yards from LOS
+        
+        # Calculate in_box relative to ball position
+        in_box = (
+            (defenders['distance_from_los'].abs() <= box_depth) &  # Within 5 yards of LOS
+            (abs(defenders['y'] - ball_position) <= box_width/2)   # Within box width centered on ball
+        ).astype(int)
+        
+        features = {
+            'defenders_in_box': sum(in_box),
+            'ball_position': ball_position  # Add this for debugging
+        }
+        
+        # Only calculate other stats if we have defenders
+        if len(defenders) > 0:
+            features.update({
+                'avg_depth': defenders['distance_from_los'].mean(),
+                'depth_std': defenders['distance_from_los'].std(),
+                'closest_defender': defenders['distance_from_los'].abs().min(),
+                'deepest_defender': defenders['distance_from_los'].abs().max(),
+                'avg_width': defenders['y'].mean(),
+                'width_std': defenders['y'].std(),
+                'left_most': defenders['y'].min(),
+                'right_most': defenders['y'].max(),
+            })
+        else:
+            # Default values if no defenders
+            features.update({
+                'avg_depth': 0,
+                'depth_std': 0,
+                'closest_defender': 0,
+                'deepest_defender': 0,
+                'avg_width': ball_position,
+                'width_std': 0,
+                'left_most': ball_position,
+                'right_most': ball_position,
+            })
+        
+        return pd.Series(features)
+
+    # Print diagnostic information
+    print("\nDiagnostic Information:")
+    print(f"Total plays: {defensive_alignments['playId'].nunique()}")
+    print(f"Plays with football: {defensive_alignments[defensive_alignments['displayName'] == 'football']['playId'].nunique()}")
     
-    # Add new defensive formation features
-    def_formation_features = defensive_alignments.groupby(['gameId', 'playId']).apply(
-        lambda x: pd.Series({
-            'edge_defenders': sum((x['distance_from_los'].abs() <= 2) & 
-                                (x['y'].between(13.3, 20) | x['y'].between(33.3, 40))),
-            'interior_defenders': sum((x['distance_from_los'].abs() <= 2) & 
-                                    x['y'].between(20, 33.3)),
-            'second_level_defenders': sum((x['distance_from_los'].between(2, 5))),
-            'left_side_defenders': sum(x['y'] < 26.65),
-            'right_side_defenders': sum(x['y'] >= 26.65),
-            'defenders_within_3yards': sum(x['distance_from_los'].abs() <= 3),
-            'max_defender_cluster': max(sum(abs(x['y'] - y) < 3) for y in x['y']),
-            'defenders_outside_numbers': sum((x['y'] <= 13.3) | (x['y'] >= 40)),
-            'defenders_between_hashes': sum(x['y'].between(23.3, 29.9)),
-            'max_gap_between_defenders': max(np.diff(sorted(x['y']))) if len(x) > 1 else 0
+    # Sample a few plays to check data
+    sample_plays = defensive_alignments.groupby('playId').first().sample(n=5, random_state=42)
+    print("\nSample plays:")
+    for _, play in sample_plays.iterrows():
+        play_data = defensive_alignments[defensive_alignments['playId'] == play.name]
+        print(f"\nPlayId: {play.name}")
+        print(f"Total frames: {len(play_data)}")
+        print(f"Has football: {'football' in play_data['displayName'].values}")
+        print(f"Unique players: {play_data['displayName'].nunique()}")
+
+    # Calculate basic defensive alignment features
+    play_features = defensive_alignments.groupby(['gameId', 'playId']).apply(calculate_box_features).reset_index()
+    
+    # Add O-line alignment features
+    oline_features = create_oline_features(defensive_alignments, play_summary, plays_df)
+    play_features = play_features.merge(oline_features, on=['gameId', 'playId'])
+    
+    def calculate_formation_features(group):
+        """Calculate formation features relative to ball position."""
+        # Get ball position
+        football_data = group[group['displayName'] == 'football']
+        if len(football_data) == 0:
+            ball_position = 26.65  # Fallback to middle
+        else:
+            ball_position = football_data['y'].iloc[0]
+            
+        defenders = group[group['displayName'] != 'football']
+        
+        if len(defenders) == 0:
+            return pd.Series({
+                'edge_defenders': 0,
+                'interior_defenders': 0,
+                'second_level_defenders': 0,
+                'left_side_defenders': 0,
+                'right_side_defenders': 0,
+                'defenders_within_3yards': 0,
+                'max_defender_cluster': 0,
+                'defenders_outside_numbers': 0,
+                'defenders_between_hashes': 0,
+                'max_gap_between_defenders': 0
+            })
+        
+        return pd.Series({
+            'edge_defenders': sum((defenders['distance_from_los'].abs() <= 2) & 
+                                ((defenders['y'] <= ball_position - 6) | 
+                                 (defenders['y'] >= ball_position + 6))),
+            'interior_defenders': sum((defenders['distance_from_los'].abs() <= 2) & 
+                                    (abs(defenders['y'] - ball_position) <= 6)),
+            'second_level_defenders': sum(defenders['distance_from_los'].between(2, 5)),
+            'left_side_defenders': sum(defenders['y'] < ball_position),
+            'right_side_defenders': sum(defenders['y'] >= ball_position),
+            'defenders_within_3yards': sum(defenders['distance_from_los'].abs() <= 3),
+            'max_defender_cluster': max(sum(abs(defenders['y'] - y) < 3) 
+                                     for y in defenders['y']),
+            'defenders_outside_numbers': sum((defenders['y'] <= ball_position - 13) | 
+                                          (defenders['y'] >= ball_position + 13)),
+            'defenders_between_hashes': sum(abs(defenders['y'] - ball_position) <= 3),
+            'max_gap_between_defenders': max(np.diff(sorted(defenders['y']))) 
+                                       if len(defenders) > 1 else 0
         })
-    ).reset_index()
     
-    # Merge new features
-    play_features = play_features.merge(def_formation_features, on=['gameId', 'playId'])
+    # Add formation features
+    formation_features = defensive_alignments.groupby(['gameId', 'playId']).apply(calculate_formation_features).reset_index()
+    play_features = play_features.merge(formation_features, on=['gameId', 'playId'])
     
-    # Add only numeric offensive context initially
+    # Add offensive context
     play_features = play_features.merge(
-        plays_df[['gameId', 'playId', 'playAction']], 
+        plays_df[['gameId', 'playId', 'offenseFormation', 'dropbackType', 
+                 'playAction', 'pff_passCoverage', 'pff_manZone']], 
         on=['gameId', 'playId']
     )
-    
-    # Now add categorical variables that need to be encoded
-    categorical_features = ['offenseFormation', 'dropbackType', 'pff_passCoverage', 'pff_manZone']
-    for feature in categorical_features:
-        # Create dummy variables for each categorical feature
-        dummies = pd.get_dummies(plays_df[['gameId', 'playId', feature]], 
-                               columns=[feature], 
-                               prefix=feature)
-        play_features = play_features.merge(dummies, on=['gameId', 'playId'])
     
     # Add pressure outcome
     play_features = play_features.merge(
         play_summary[['gameId', 'playId', 'causedPressure']], 
         on=['gameId', 'playId']
     )
-    
-    # Calculate relative features
-    play_features['edge_to_interior_ratio'] = (play_features['edge_defenders'] / (play_features['interior_defenders'] + 0.1))
-    play_features['second_level_ratio'] = (play_features['second_level_defenders'] / (play_features['defenders_within_3yards'] + 0.1))
-    play_features['defensive_imbalance'] = abs(play_features['left_side_defenders'] - play_features['right_side_defenders'])
-    play_features['center_presence'] = play_features['defenders_between_hashes'] / (play_features['box_defenders'] + 0.1)
-    
-    # Convert playAction to numeric
-    play_features['playAction'] = play_features['playAction'].astype(int)
     
     return play_features
 
@@ -264,11 +483,13 @@ def train_multiple_models(X_train, X_test, y_train, y_test, feature_names):
     models = {
         'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
         'XGBoost': XGBClassifier(
-            n_estimators=100,
-            learning_rate=0.1,
-            max_depth=5,
+            n_estimators=200,
+            learning_rate=0.05,
+            max_depth=8,
+            min_child_weight=3,
+            subsample=0.8,
+            colsample_bytree=0.8,
             random_state=42,
-            scale_pos_weight=2
         ),
         'LightGBM': LGBMClassifier(
             # Basic parameters
@@ -375,39 +596,125 @@ def train_multiple_models(X_train, X_test, y_train, y_test, feature_names):
     return results, feature_importance_df
 
 def build_pressure_model(play_features):
-    """Build and evaluate multiple pressure prediction models."""
-    # Select features for model
-    feature_columns = [col for col in play_features.columns 
+    """Build and evaluate multiple pressure prediction models with proper categorical handling."""
+    # Identify categorical columns
+    categorical_columns = [
+        'offenseFormation', 
+        'dropbackType', 
+        'pff_passCoverage', 
+        'pff_manZone'
+    ]
+    
+    # Convert playAction to numeric if it isn't already
+    play_features['playAction'] = play_features['playAction'].astype(int)
+    
+    # Create dummy variables for categorical features
+    df_encoded = pd.get_dummies(
+        play_features, 
+        columns=categorical_columns,
+        prefix=categorical_columns
+    )
+    
+    # Select features for model (exclude non-feature columns)
+    feature_columns = [col for col in df_encoded.columns 
                       if col not in ['gameId', 'playId', 'causedPressure']]
     
-    X = play_features[feature_columns]
-    y = play_features['causedPressure']
+    X = df_encoded[feature_columns]
+    y = df_encoded['causedPressure']
     
     # Split data
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # Scale features
+    # Scale the numeric features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    # Train and evaluate models
-    results, feature_importance = train_multiple_models(
-        X_train_scaled, 
-        X_test_scaled, 
-        y_train, 
-        y_test, 
-        feature_columns
-    )
+    # Print feature information
+    print("\nFeature Information:")
+    print(f"Total features: {len(feature_columns)}")
+    print("\nFeature types:")
+    for col in X.columns:
+        print(f"{col}: {X[col].dtype}")
     
-    # Use the best performing model
+    # Train and evaluate models
+    models = {
+        'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+        'XGBoost': XGBClassifier(
+            n_estimators=200,
+            max_depth=8,
+            learning_rate=0.05,
+            min_child_weight=3,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42
+        ),
+        'LightGBM': LGBMClassifier(
+            n_estimators=100,
+            learning_rate=0.1,
+            random_state=42,
+            class_weight='balanced',
+            max_depth=6,
+            num_leaves=31,
+            min_child_samples=20,
+            min_split_gain=0.1,
+            min_child_weight=1e-3,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            force_row_wise=True,
+            verbose=-1,
+            feature_fraction=0.8,
+            bagging_fraction=0.8,
+            bagging_freq=5
+        )
+    }
+    
+    results = {}
+    feature_importance_df = pd.DataFrame()
+    
+    # Train and evaluate each model
+    for name, model in models.items():
+        print(f"\n{name} Results:")
+        
+        # Train model
+        model.fit(X_train_scaled, y_train)
+        
+        # Make predictions
+        y_pred = model.predict(X_test_scaled)
+        y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+        
+        # Calculate metrics
+        roc_auc = roc_auc_score(y_test, y_pred_proba)
+        
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred))
+        print(f"ROC AUC Score: {roc_auc:.3f}")
+        
+        # Get feature importance
+        importance = model.feature_importances_
+            
+        # Store feature importance
+        model_importance = pd.DataFrame({
+            'Feature': feature_columns,
+            'Importance': importance,
+            'Model': name
+        })
+        feature_importance_df = pd.concat([feature_importance_df, model_importance])
+        
+        # Store results
+        results[name] = {
+            'model': model,
+            'roc_auc': roc_auc,
+            'predictions': y_pred,
+            'probabilities': y_pred_proba
+        }
+    
+    # Use best performing model
     best_model_name = max(results, key=lambda x: results[x]['roc_auc'])
     best_model = results[best_model_name]['model']
-    
     print(f"\nBest performing model: {best_model_name}")
     
-    return best_model, scaler, feature_columns, feature_importance
-
+    return best_model, scaler, feature_columns, feature_importance_df
 
 def calculate_pppi(model, scaler, feature_columns, play_features):
     """Calculate the Pre-snap Pressure Prediction Index."""
@@ -443,10 +750,10 @@ def main():
     games_df, plays_df, players_df, player_play_df = static_data
     
     # Data validation
-    print("\nData Validation:")
-    print(f"Unique teams in tracking data: {tracking_df['club'].nunique()}")
-    print(f"Team abbreviations in tracking data: {sorted(tracking_df['club'].unique())}")
-    print(f"Defensive teams in plays data: {sorted(plays_df['defensiveTeam'].unique())}")
+    # print("\nData Validation:")
+    # print(f"Unique teams in tracking data: {tracking_df['club'].nunique()}")
+    # print(f"Team abbreviations in tracking data: {sorted(tracking_df['club'].unique())}")
+    # print(f"Defensive teams in plays data: {sorted(plays_df['defensiveTeam'].unique())}")
     
     # Process plays
     passing_plays = filter_passing_plays(plays_df)
