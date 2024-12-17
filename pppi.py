@@ -1,6 +1,3 @@
-# Areas to improve: add in offensive line formation
-
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,6 +10,21 @@ from sklearn.metrics import classification_report, roc_auc_score, roc_curve
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
+from imblearn.over_sampling import SMOTE
+from sklearn.ensemble import StackingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
+from sklearn.feature_selection import RFE
+import shap
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.calibration import CalibratedClassifierCV
+from imblearn.combine import SMOTETomek
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from catboost import CatBoostClassifier
+from sklearn.ensemble import VotingClassifier
 warnings.filterwarnings('ignore')
 
 def load_tracking_data(weeks=range(1, 10), data_dir='nfl-big-data-bowl-2025'):
@@ -325,107 +337,61 @@ def create_enhanced_pressure_features(defensive_alignments, play_summary, plays_
                            'avg_orientation', 'orientation_std',
                            'avg_direction', 'direction_std']
     
-    # Add pre-snap movement features
-    movement_features = defensive_alignments.groupby(['gameId', 'playId']).apply(
-        lambda x: pd.Series({
-            'defenders_in_motion': sum(x['s'] > 0.1),
-            'defenders_accelerating': sum(x['a'] > 0.1),
-            'defenders_facing_backfield': sum(abs(x['o'] - 90) < 45),
-            'defenders_moving_forward': sum(abs(x['dir'] - 90) < 45)
-        })
-    ).reset_index()
-    
-    # Add defensive formation features
-    formation_features = defensive_alignments.groupby(['gameId', 'playId']).apply(
-        lambda x: pd.Series({
-            'defensive_asymmetry': abs(sum(x['distance_from_ball_y'] < 26.65) - 
-                                     sum(x['distance_from_ball_y'] >= 26.65)),
-            'max_gap_between_defenders': max(np.diff(sorted(x['distance_from_ball_y']))) if len(x) > 1 else 0,
-            'defenders_outside_numbers': sum((x['distance_from_ball_y'] <= 13.3) | (x['distance_from_ball_y'] >= 40)),
-            'defenders_between_hashes': sum(x['distance_from_ball_y'].between(23.3, 29.9))
-        })
-    ).reset_index()
-    
-    # Add situational features
-    situational_features = plays_df[['gameId', 'playId', 'down', 'yardsToGo', 
-                                    'absoluteYardlineNumber', 'preSnapHomeScore',
-                                    'preSnapVisitorScore']].copy()
-    
-    situational_features['score_differential'] = abs(
-        situational_features['preSnapHomeScore'] - 
-        situational_features['preSnapVisitorScore']
+    # Add play situation features
+    play_features = play_features.merge(
+        plays_df[['gameId', 'playId', 'down', 'yardsToGo', 'absoluteYardlineNumber']], 
+        on=['gameId', 'playId']
     )
     
-    # Merge all features
+    # Add non-pressure matchup features
+    matchup_features = player_play_df.groupby(['gameId', 'playId']).apply(
+        lambda x: pd.Series({
+            'num_pass_rushers': sum(x['wasInitialPassRusher'] == 1),
+            'num_blockers': x['blockedPlayerNFLId1'].notna().sum(),
+            'rusher_to_blocker_ratio': sum(x['wasInitialPassRusher'] == 1) / 
+                                      (x['blockedPlayerNFLId1'].notna().sum() + 1e-6)
+        })
+    ).reset_index()
+    
+    # Add defensive clustering features
+    clustering_features = defensive_alignments.groupby(['gameId', 'playId']).apply(
+        lambda x: pd.Series({
+            'min_defender_spacing': min(np.diff(sorted(x['distance_from_ball_y']))) if len(x) > 1 else 0,
+            'avg_defender_spacing': np.mean(np.diff(sorted(x['distance_from_ball_y']))) if len(x) > 1 else 0,
+            'front_7_depth_variance': x[x['distance_from_ball_x'] <= 7]['distance_from_ball_x'].var(),
+            'front_7_width_variance': x[x['distance_from_ball_x'] <= 7]['distance_from_ball_y'].var(),
+            'rushers_with_speed': sum((x['s'] > 2) & (x['distance_from_ball_x'] <= 5)),
+            'rushers_accelerating': sum((x['a'] > 1) & (x['distance_from_ball_x'] <= 5))
+        })
+    ).reset_index()
+    
+    # Merge features
     play_features = (play_features
-        .merge(movement_features, on=['gameId', 'playId'])
-        .merge(formation_features, on=['gameId', 'playId'])
-        .merge(situational_features, on=['gameId', 'playId'])
+        .merge(matchup_features, on=['gameId', 'playId'])
+        .merge(clustering_features, on=['gameId', 'playId'])
         .merge(ol_features, on=['gameId', 'playId'])
     )
     
-    # Add categorical variables
-    categorical_features = ['offenseFormation', 'dropbackType', 'pff_passCoverage', 'pff_manZone']
-    for feature in categorical_features:
-        if feature in plays_df.columns:
-            dummies = pd.get_dummies(plays_df[['gameId', 'playId', feature]], 
-                                   columns=[feature], 
-                                   prefix=feature)
-            play_features = play_features.merge(dummies, on=['gameId', 'playId'])
+    # Create feature interactions
+    play_features = create_feature_interactions(play_features)
     
-    # Add pressure outcome
-    play_features = play_features.merge(
-        play_summary[['gameId', 'playId', 'causedPressure']], 
-        on=['gameId', 'playId']
-    )
+    # Add target variable last and only for training
+    if 'causedPressure' in play_summary.columns:
+        play_features = play_features.merge(
+            play_summary[['gameId', 'playId', 'causedPressure']], 
+            on=['gameId', 'playId']
+        )
     
     return play_features
 
 def train_multiple_models(X_train, X_test, y_train, y_test, feature_names):
-    """
-    Train and evaluate multiple models on the same data
-    """
-    # Initialize models
+    """Train and evaluate multiple models including stacked ensemble."""
+    # Add stacked model to our models dictionary
     models = {
         'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
-        'XGBoost': XGBClassifier(
-            n_estimators=100,
-            learning_rate=0.1,
-            max_depth=5,
-            random_state=42,
-            scale_pos_weight=2
-        ),
-        'LightGBM': LGBMClassifier(
-            # Basic parameters
-            n_estimators=100,
-            learning_rate=0.1,
-            random_state=42,
-            
-            # Class imbalance handling
-            class_weight='balanced',
-            
-            # Tree structure parameters
-            max_depth=6,
-            num_leaves=31,  # 2^(max_depth) - 1
-            min_child_samples=20,  # Minimum number of data needed in a leaf
-            
-            # Split finding parameters
-            min_split_gain=0.1,  # Minimum gain to make a split
-            min_child_weight=1e-3,  # Minimum sum of instance weight needed in a child
-            
-            # Regularization parameters
-            reg_alpha=0.1,  # L1 regularization
-            reg_lambda=0.1,  # L2 regularization
-            
-            # Performance parameters
-            force_row_wise=True,  # Remove overhead warning
-            verbose=-1,  # Reduce verbosity
-            
-            # Additional parameters for better splits
-            feature_fraction=0.8,  # Use 80% of features in each iteration
-            bagging_fraction=0.8,  # Use 80% of data in each iteration
-            bagging_freq=5,  # Perform bagging every 5 iterations
-        )
+        'XGBoost': XGBClassifier(n_estimators=100, scale_pos_weight=2, random_state=42),
+        'LightGBM': LGBMClassifier(class_weight='balanced', random_state=42),
+        'Stacked Ensemble': create_stacked_model()
     }
     
     results = {}
@@ -449,16 +415,17 @@ def train_multiple_models(X_train, X_test, y_train, y_test, feature_names):
         print(classification_report(y_test, y_pred))
         print(f"ROC AUC Score: {roc_auc:.3f}")
         
-        # Get feature importance
-        importance = model.feature_importances_
+        # Get feature importance (skip for Stacked Ensemble)
+        if name != 'Stacked Ensemble':
+            importance = model.feature_importances_
             
-        # Store feature importance
-        model_importance = pd.DataFrame({
-            'Feature': feature_names,
-            'Importance': importance,
-            'Model': name
-        })
-        feature_importance_df = pd.concat([feature_importance_df, model_importance])
+            # Store feature importance
+            model_importance = pd.DataFrame({
+                'Feature': feature_names,
+                'Importance': importance,
+                'Model': name
+            })
+            feature_importance_df = pd.concat([feature_importance_df, model_importance])
         
         # Store results
         results[name] = {
@@ -468,19 +435,21 @@ def train_multiple_models(X_train, X_test, y_train, y_test, feature_names):
             'probabilities': y_pred_proba
         }
     
-    # Plot feature importance comparison
-    plt.figure(figsize=(12, 6))
-    top_features = (feature_importance_df.groupby('Feature')['Importance']
-                   .mean()
-                   .sort_values(ascending=False)
-                   .head(10)
-                   .index)
-    
-    comparison_df = feature_importance_df[feature_importance_df['Feature'].isin(top_features)]
-    
-    sns.barplot(data=comparison_df, x='Importance', y='Feature', hue='Model')
-    plt.title('Feature Importance Comparison Across Models')
-    plt.tight_layout()
+    # Only plot feature importance if we have data
+    if not feature_importance_df.empty:
+        # Plot feature importance comparison
+        plt.figure(figsize=(12, 6))
+        top_features = (feature_importance_df.groupby('Feature')['Importance']
+                       .mean()
+                       .sort_values(ascending=False)
+                       .head(10)
+                       .index)
+        
+        comparison_df = feature_importance_df[feature_importance_df['Feature'].isin(top_features)]
+        
+        sns.barplot(data=comparison_df, x='Importance', y='Feature', hue='Model')
+        plt.title('Feature Importance Comparison Across Models')
+        plt.tight_layout()
     
     # Plot ROC curves
     plt.figure(figsize=(8, 6))
@@ -499,8 +468,114 @@ def train_multiple_models(X_train, X_test, y_train, y_test, feature_names):
     
     return results, feature_importance_df
 
+def analyze_feature_importance(model, X_train, X_test, y_train, y_test, feature_names):
+    """Analyze feature importance using multiple methods."""
+    importance_results = {}
+    
+    # 1. Permutation Importance
+    perm_importance = permutation_importance(
+        model, X_test, y_test, n_repeats=10, random_state=42, n_jobs=-1
+    )
+    
+    perm_importance_df = pd.DataFrame({
+        'Feature': feature_names,
+        'Importance': perm_importance.importances_mean,
+        'Std': perm_importance.importances_std
+    }).sort_values('Importance', ascending=False)
+    
+    importance_results['permutation'] = perm_importance_df
+    
+    # 2. SHAP Values (for tree-based models)
+    if hasattr(model, 'predict_proba'):
+        try:
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_test)
+            
+            if isinstance(shap_values, list):  # For multi-class output
+                shap_values = shap_values[1]  # Take positive class
+                
+            shap_importance_df = pd.DataFrame({
+                'Feature': feature_names,
+                'Importance': np.abs(shap_values).mean(0)
+            }).sort_values('Importance', ascending=False)
+            
+            importance_results['shap'] = shap_importance_df
+            
+            # Plot SHAP summary
+            plt.figure(figsize=(10, 6))
+            shap.summary_plot(shap_values, X_test, feature_names=feature_names, show=False)
+            plt.title('SHAP Feature Importance')
+            plt.tight_layout()
+            
+        except Exception as e:
+            print(f"Warning: SHAP analysis failed: {e}")
+    
+    # 3. Recursive Feature Elimination
+    rfe = RFE(
+        estimator=RandomForestClassifier(n_estimators=100, random_state=42),
+        n_features_to_select=20
+    )
+    
+    rfe.fit(X_train, y_train)
+    rfe_importance_df = pd.DataFrame({
+        'Feature': feature_names,
+        'Selected': rfe.support_,
+        'Ranking': rfe.ranking_
+    }).sort_values('Ranking')
+    
+    importance_results['rfe'] = rfe_importance_df
+    
+    # Plot combined importance analysis
+    plt.figure(figsize=(12, 6))
+    
+    # Get top 20 features from permutation importance
+    top_features = perm_importance_df.head(20)['Feature']
+    
+    # Create comparison plot
+    comparison_data = []
+    for feature in top_features:
+        feature_data = {
+            'Feature': feature,
+            'Permutation': perm_importance_df[perm_importance_df['Feature'] == feature]['Importance'].iloc[0],
+            'SHAP': shap_importance_df[shap_importance_df['Feature'] == feature]['Importance'].iloc[0] if 'shap' in importance_results else 0,
+            'RFE_Selected': rfe_importance_df[rfe_importance_df['Feature'] == feature]['Selected'].iloc[0]
+        }
+        comparison_data.append(feature_data)
+    
+    comparison_df = pd.DataFrame(comparison_data)
+    
+    # Normalize importance scores
+    comparison_df['Permutation'] = comparison_df['Permutation'] / comparison_df['Permutation'].max()
+    if 'shap' in importance_results:
+        comparison_df['SHAP'] = comparison_df['SHAP'] / comparison_df['SHAP'].max()
+    
+    # Plot
+    plt.subplot(1, 2, 1)
+    sns.barplot(data=comparison_df, x='Permutation', y='Feature')
+    plt.title('Permutation Importance')
+    
+    if 'shap' in importance_results:
+        plt.subplot(1, 2, 2)
+        sns.barplot(data=comparison_df, x='SHAP', y='Feature')
+        plt.title('SHAP Importance')
+    
+    plt.tight_layout()
+    
+    # Print feature importance summary
+    print("\nTop 10 Most Important Features (Permutation Importance):")
+    print(perm_importance_df.head(10))
+    
+    if 'shap' in importance_results:
+        print("\nTop 10 Most Important Features (SHAP):")
+        print(shap_importance_df.head(10))
+    
+    print("\nSelected Features by RFE:")
+    print(rfe_importance_df[rfe_importance_df['Selected']].sort_values('Ranking'))
+    
+    return importance_results
+
 def build_pressure_model(play_features):
-    """Build and evaluate multiple pressure prediction models."""
+    """Build and evaluate multiple pressure prediction models with advanced techniques."""
     # Select features for model
     feature_columns = [col for col in play_features.columns 
                       if col not in ['gameId', 'playId', 'causedPressure']]
@@ -508,22 +583,152 @@ def build_pressure_model(play_features):
     X = play_features[feature_columns]
     y = play_features['causedPressure']
     
+    # Get enhanced cross-validation strategy
+    cv = get_enhanced_cv()
+    
     # Split data
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
+    # Handle missing values first
+    imputer = SimpleImputer(strategy='median')
+    X_train_imputed = imputer.fit_transform(X_train)
+    X_test_imputed = imputer.transform(X_test)
+    
     # Scale features
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    X_train_scaled = scaler.fit_transform(X_train_imputed)
+    X_test_scaled = scaler.transform(X_test_imputed)
     
-    # Train and evaluate models
-    results, feature_importance = train_multiple_models(
-        X_train_scaled, 
-        X_test_scaled, 
-        y_train, 
-        y_test, 
-        feature_columns
+    # Use SMOTETomek for better balanced data
+    smotetomek = SMOTETomek(random_state=42)
+    X_train_balanced, y_train_balanced = smotetomek.fit_resample(X_train_scaled, y_train)
+    
+    # Initialize models with calibration
+    models = {
+        'Random Forest': CalibratedClassifierCV(
+            RandomForestClassifier(
+                n_estimators=300,
+                max_depth=6,
+                min_samples_leaf=10,
+                class_weight='balanced_subsample',
+                random_state=42
+            ),
+            cv=cv,
+            method='sigmoid'
+        ),
+        'XGBoost': CalibratedClassifierCV(
+            get_refined_xgboost(),
+            cv=cv,
+            method='sigmoid'
+        ),
+        'LightGBM': CalibratedClassifierCV(
+            get_optimized_lgbm(),
+            cv=cv,
+            method='sigmoid'
+        ),
+        'CatBoost': CalibratedClassifierCV(
+            get_optimized_catboost(),
+            cv=cv,
+            method='sigmoid'
+        ),
+        'Voting Ensemble': get_voting_ensemble()
+    }
+    
+    # Train neural network separately
+    nn_model = NeuralNetworkWrapper()
+    nn_model.fit(X_train_balanced, y_train_balanced)
+    nn_pred_proba = nn_model.predict_proba(X_test_scaled)
+    nn_pred = nn_model.predict(X_test_scaled)
+    nn_roc_auc = roc_auc_score(y_test, nn_pred_proba[:, 1])
+    
+    print("\nNeural Network Results:")
+    print("\nClassification Report:")
+    print(classification_report(y_test, nn_pred))
+    print(f"ROC AUC Score: {nn_roc_auc:.3f}")
+    
+    # Train and evaluate models with cross-validation
+    results = {}
+    feature_importance_df = pd.DataFrame()
+    
+    for name, model in models.items():
+        if name != 'Neural Network':
+            print(f"\n{name} Results:")
+            
+            # Perform cross-validation
+            cv_scores = cross_val_score(
+                model, X_train_balanced, y_train_balanced, 
+                cv=cv, scoring='roc_auc', n_jobs=-1
+            )
+            print(f"Cross-validation ROC AUC scores: {cv_scores}")
+            print(f"Mean CV ROC AUC: {cv_scores.mean():.3f} (+/- {cv_scores.std() * 2:.3f})")
+            
+            # Train final model
+            model.fit(X_train_balanced, y_train_balanced)
+            
+            # Make predictions
+            y_pred = model.predict(X_test_scaled)
+            y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+            
+            # Calculate metrics
+            roc_auc = roc_auc_score(y_test, y_pred_proba)
+            
+            print("\nClassification Report:")
+            print(classification_report(y_test, y_pred))
+            print(f"ROC AUC Score: {roc_auc:.3f}")
+            
+            # Store results
+            results[name] = {
+                'model': model,
+                'roc_auc': roc_auc,
+                'predictions': y_pred,
+                'probabilities': y_pred_proba,
+                'cv_scores': cv_scores
+            }
+    
+    # Create stacked model using calibrated base models
+    base_estimators = [
+        (name.lower().replace(' ', '_'), model) 
+        for name, model in models.items()
+    ]
+    
+    stacked_model = StackingClassifier(
+        estimators=base_estimators,
+        final_estimator=CalibratedClassifierCV(
+            LGBMClassifier(
+                n_estimators=100,
+                learning_rate=0.03,
+                num_leaves=8,
+                max_depth=3,
+                class_weight='balanced',
+                
+                random_state=42,
+                verbose=-1
+            ),
+            cv=cv,
+            method='sigmoid'
+        ),
+        cv=cv,
+        n_jobs=-1
     )
+    
+    # Train and evaluate stacked model
+    print("\nStacked Ensemble Results:")
+    stacked_model.fit(X_train_balanced, y_train_balanced)
+    
+    y_pred = stacked_model.predict(X_test_scaled)
+    y_pred_proba = stacked_model.predict_proba(X_test_scaled)[:, 1]
+    roc_auc = roc_auc_score(y_test, y_pred_proba)
+    
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred))
+    print(f"ROC AUC Score: {roc_auc:.3f}")
+    
+    results['Stacked Ensemble'] = {
+        'model': stacked_model,
+        'roc_auc': roc_auc,
+        'predictions': y_pred,
+        'probabilities': y_pred_proba
+    }
     
     # Use the best performing model
     best_model_name = max(results, key=lambda x: results[x]['roc_auc'])
@@ -531,8 +736,17 @@ def build_pressure_model(play_features):
     
     print(f"\nBest performing model: {best_model_name}")
     
-    return best_model, scaler, feature_columns, feature_importance
-
+    # Analyze feature importance for the best model
+    importance_analysis = analyze_feature_importance(
+        best_model,
+        X_train_balanced,
+        X_test_scaled,
+        y_train_balanced,
+        y_test,
+        feature_columns
+    )
+    
+    return best_model, scaler, feature_columns, importance_analysis
 
 def calculate_pppi(model, scaler, feature_columns, play_features):
     """Calculate the Pre-snap Pressure Prediction Index."""
@@ -595,6 +809,284 @@ def analyze_offensive_line(pre_snap_data, plays_df):
     ).reset_index()
     
     return play_summary
+
+def create_feature_interactions(play_features):
+    """Create interaction features between important variables."""
+    # Base interactions
+    play_features['speed_depth_interaction'] = play_features['avg_speed'] * play_features['avg_depth']
+    play_features['box_pressure_potential'] = play_features['box_defenders'] * play_features['avg_speed']
+    play_features['edge_speed_threat'] = play_features['edge_defenders'] * play_features['max_speed']
+    
+    # Enhanced defensive formation features based on important metrics
+    play_features['defensive_spread'] = play_features['width_std'] * play_features['depth_std']
+    play_features['box_density'] = play_features['box_defenders'] / (play_features['width_std'] + 1e-6)
+    
+    # Refined front complexity using top features
+    play_features['front_complexity'] = (
+        play_features['line_defenders'] * 
+        play_features['edge_defenders'] * 
+        play_features['width_std'] *
+        (1 + play_features['avg_orientation'] / 180)  # Add orientation impact
+    )
+    
+    # Enhanced rusher effectiveness metric
+    play_features['rusher_effectiveness'] = (
+        play_features['num_pass_rushers'] * 
+        play_features['avg_speed'] * 
+        (1 / (play_features['avg_defender_spacing'] + 1e-6)) *
+        (1 + play_features['front_complexity'] / 10)
+    )
+    
+    # Defensive momentum and positioning
+    play_features['defensive_momentum'] = (
+        play_features['avg_speed'] * 
+        play_features['avg_accel'] * 
+        (1 / (play_features['avg_depth'] + 1)) *
+        (1 + play_features['orientation_std'] / 180)  # Add orientation factor
+    )
+    
+    # Enhanced edge pressure calculations
+    play_features['edge_pressure_potential'] = (
+        play_features['edge_defenders'] * 
+        play_features['max_speed'] * 
+        (1 / (play_features['ol_spacing'] + 1e-6)) *
+        (1 + play_features['ol_width'] / 20)  # Factor in OL width
+    )
+    
+    # Situational pressure features
+    if 'down' in play_features.columns and 'yardsToGo' in play_features.columns:
+        # Critical down and distance situations
+        play_features['pressure_situation'] = (
+            ((play_features['down'] >= 3) & (play_features['yardsToGo'] >= 7)) |  # 3rd/4th and long
+            ((play_features['down'] == 2) & (play_features['yardsToGo'] >= 10))   # 2nd and very long
+        ).astype(int)
+        
+        # Enhanced situational pressure intensity
+        play_features['situational_pressure_intensity'] = (
+            play_features['pressure_situation'] * 
+            play_features['defensive_momentum'] * 
+            (1 + play_features['down'] / 4) *  # Down weight
+            (1 + play_features['yardsToGo'] / 20)  # Distance weight
+        )
+         # Down-specific pressure likelihood
+        play_features['down_pressure'] = np.where(
+            play_features['down'] >= 3,
+            play_features['down'] * 1.5,  # Higher weight for 3rd/4th down
+            play_features['down']
+        )
+
+        
+        # Enhanced situational pressure
+        play_features['situation_severity'] = (
+            play_features['down_pressure'] * 
+            (1 + play_features['yardsToGo'] / 10) *  # Scale by yards to go
+            (1 + (play_features['num_pass_rushers'] > 4).astype(int) * 0.5)  # Extra rushers bonus
+        )
+    
+    # Defensive spacing effectiveness
+    play_features['spacing_effectiveness'] = (
+        (1 / (play_features['min_defender_spacing'] + 1e-6)) * 
+        play_features['avg_defender_spacing'] *
+        play_features['front_complexity']
+    )
+    
+    # OL stress metrics based on important features
+    play_features['ol_pressure_index'] = (
+        play_features['num_pass_rushers'] / 
+        (play_features['ol_width'] + 1e-6) *
+        (1 + play_features['front_complexity'] / 10)
+    )
+    
+    # Normalize key metrics
+    for col in ['rusher_effectiveness', 'spacing_effectiveness', 'ol_pressure_index']:
+        if col in play_features.columns:
+            play_features[col] = np.clip(
+                play_features[col],
+                play_features[col].quantile(0.05),
+                play_features[col].quantile(0.95)
+            )
+    
+    return play_features
+
+def create_stacked_model():
+    base_estimators = [
+        ('rf', RandomForestClassifier(
+            n_estimators=300,
+            max_depth=6,
+            min_samples_leaf=10,
+            class_weight='balanced_subsample',
+            random_state=42
+        )),
+        ('xgb', get_refined_xgboost()),  # Use optimized XGBoost
+        ('lgb', get_optimized_lgbm())    # Use optimized LightGBM
+    ]
+    
+    return StackingClassifier(
+        estimators=base_estimators,
+        final_estimator=get_optimized_lgbm(),  # Use optimized LightGBM as final estimator
+        cv=get_enhanced_cv(),  # Use enhanced CV strategy
+        n_jobs=-1
+    )
+
+def get_optimized_lgbm():
+    return LGBMClassifier(
+        n_estimators=200,            # Reduced from 300
+        learning_rate=0.05,          # Increased from 0.02
+        num_leaves=31,               # Increased from 16
+        max_depth=6,                 # Increased from 4
+        min_child_samples=20,        # Reduced from 30
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_split_gain=1e-3,         # Added minimum split gain
+        min_child_weight=1e-3,       # Added minimum child weight
+        class_weight='balanced',
+        reg_alpha=0.1,               # Reduced from 0.2
+        reg_lambda=0.1,              # Reduced from 0.2
+        random_state=42,
+        verbose=-1
+    )
+
+def create_weighted_ensemble(models, weights):
+    def weighted_predict_proba(X):
+        probas = np.array([model.predict_proba(X) for model in models])
+        return np.average(probas, axis=0, weights=weights)
+    return weighted_predict_proba
+
+def get_refined_xgboost():
+    return XGBClassifier(
+        n_estimators=300,
+        learning_rate=0.01,
+        max_depth=4,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=5,
+        scale_pos_weight=2,
+        reg_alpha=0.3,
+        reg_lambda=0.3,
+        random_state=42
+    )
+
+def get_enhanced_cv():
+    return StratifiedKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=42
+    )
+
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_size, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        return self.model(x)
+
+class NeuralNetworkWrapper:
+    def __init__(self):
+        self.model = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    def get_params(self, deep=True):
+        # Implement get_params for scikit-learn compatibility
+        return {"model": self.model, "device": self.device}
+    
+    def set_params(self, **parameters):
+        # Implement set_params for scikit-learn compatibility
+        for parameter, value in parameters.items():
+            setattr(self, parameter, value)
+        return self
+    
+    def fit(self, X, y):
+        # Convert to PyTorch tensors
+        X = torch.FloatTensor(X).to(self.device)
+        y = torch.FloatTensor(y).to(self.device)
+        
+        # Create model
+        self.model = NeuralNetwork(X.shape[1]).to(self.device)
+        
+        # Create data loader
+        dataset = TensorDataset(X, y.reshape(-1, 1))
+        train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+        
+        # Training setup
+        criterion = nn.BCELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        
+        # Training loop
+        self.model.train()
+        for epoch in range(100):
+            for batch_X, batch_y in train_loader:
+                optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+        
+        return self
+    
+    def predict(self, X):
+        # Implement predict for scikit-learn compatibility
+        proba = self.predict_proba(X)
+        return (proba[:, 1] >= 0.5).astype(int)
+    
+    def predict_proba(self, X):
+        # Convert to PyTorch tensor
+        X = torch.FloatTensor(X).to(self.device)
+        
+        # Get predictions
+        self.model.eval()
+        with torch.no_grad():
+            preds = self.model(X).cpu().numpy()
+        
+        # Return probabilities for both classes
+        return np.column_stack([1-preds, preds])
+
+def get_optimized_catboost():
+    return CatBoostClassifier(
+        iterations=500,
+        learning_rate=0.02,
+        depth=6,
+        l2_leaf_reg=3,
+        bootstrap_type='Bernoulli',
+        subsample=0.8,
+        class_weights={0: 1, 1: 2},
+        random_seed=42,
+        verbose=False
+    )
+
+def get_voting_ensemble():
+    estimators = [
+        ('rf', RandomForestClassifier(
+            n_estimators=300,
+            max_depth=6,
+            min_samples_leaf=10,
+            class_weight='balanced_subsample',
+            random_state=42
+        )),
+        ('xgb', get_refined_xgboost()),
+        ('lgb', get_optimized_lgbm()),
+        ('cat', get_optimized_catboost())
+    ]
+    
+    return VotingClassifier(
+        estimators=estimators,
+        voting='soft',
+        weights=[1, 1.2, 1.2, 1.2]
+    )
 
 def main():
     # Use the default directory name where the data files are located
@@ -659,12 +1151,15 @@ def main():
         enhanced_features
     )
     
-    # Analyze results
+    # Analyze results with handling for duplicate bin edges
     enhanced_features_with_pppi['pppi_quartile'] = pd.qcut(
         enhanced_features_with_pppi['pppi'], 
         q=4, 
-        labels=['Q1', 'Q2', 'Q3', 'Q4']
+        labels=['Q1', 'Q2', 'Q3', 'Q4'],
+        duplicates='drop'  # Handle duplicate bin edges
     )
+    
+    # Analyze results
     pressure_by_quartile = enhanced_features_with_pppi.groupby('pppi_quartile')['causedPressure'].agg(['mean', 'count'])
     print("\nPressure Rate by PPPI Quartile:")
     print(pressure_by_quartile)
