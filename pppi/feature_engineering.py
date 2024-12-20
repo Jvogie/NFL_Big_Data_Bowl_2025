@@ -17,7 +17,7 @@ def analyze_defensive_alignment(pre_snap_data, pressure_data, plays_df, players_
     for (game_id, play_id), play_data in pre_snap_data.groupby(['gameId', 'playId']):
         # Get the last frame before snap
         max_frame = play_data['frameId'].max()
-        last_frame = play_data[play_data['frameId'] == max_frame]
+        last_frame = play_data[play_data['frameId'] == max_frame].copy()  # Create explicit copy
         
         # Get ball position for this play
         ball_data = last_frame[last_frame['nflId'].isna()]
@@ -41,8 +41,8 @@ def analyze_defensive_alignment(pre_snap_data, pressure_data, plays_df, players_
         
         # Add ball position to all rows for this play
         ball_pos = ball_data.iloc[0]
-        last_frame['ball_x'] = ball_pos['x']
-        last_frame['ball_y'] = ball_pos['y']
+        last_frame.loc[:, 'ball_x'] = ball_pos['x']
+        last_frame.loc[:, 'ball_y'] = ball_pos['y']
         
         last_frames.append(last_frame)
         play_count += 1
@@ -141,7 +141,7 @@ def analyze_offensive_line(pre_snap_data, plays_df):
     
     return play_summary
 
-def create_enhanced_pressure_features(defensive_alignments, play_summary, plays_df, player_play_df, ol_features):
+def create_enhanced_pressure_features(defensive_alignments, pressure_data, plays_df, player_play_df, ol_features):
     """Create enhanced features including offensive line metrics."""
     # Base defensive features
     play_features = defensive_alignments.groupby(['gameId', 'playId']).agg({
@@ -172,6 +172,10 @@ def create_enhanced_pressure_features(defensive_alignments, play_summary, plays_
         on=['gameId', 'playId']
     )
     
+    # Add pressure data
+    pressure_summary = pressure_data.groupby(['gameId', 'playId'])['causedPressure'].max().reset_index()
+    play_features = play_features.merge(pressure_summary, on=['gameId', 'playId'], how='left')
+    
     # Add non-pressure matchup features
     matchup_features = player_play_df.groupby(['gameId', 'playId']).apply(
         lambda x: pd.Series({
@@ -182,13 +186,19 @@ def create_enhanced_pressure_features(defensive_alignments, play_summary, plays_
         })
     ).reset_index()
     
-    # Add defensive clustering features
+    # Add defensive clustering features with NaN handling
     clustering_features = defensive_alignments.groupby(['gameId', 'playId']).apply(
         lambda x: pd.Series({
             'min_defender_spacing': min(np.diff(sorted(x['distance_from_ball_y']))) if len(x) > 1 else 0,
             'avg_defender_spacing': np.mean(np.diff(sorted(x['distance_from_ball_y']))) if len(x) > 1 else 0,
-            'front_7_depth_variance': x[x['distance_from_ball_x'] <= 7]['distance_from_ball_x'].var(),
-            'front_7_width_variance': x[x['distance_from_ball_x'] <= 7]['distance_from_ball_y'].var(),
+            'front_7_depth_variance': (
+                x[x['distance_from_ball_x'] <= 7]['distance_from_ball_x'].var()
+                if len(x[x['distance_from_ball_x'] <= 7]) > 1 else 0
+            ),
+            'front_7_width_variance': (
+                x[x['distance_from_ball_x'] <= 7]['distance_from_ball_y'].var()
+                if len(x[x['distance_from_ball_x'] <= 7]) > 1 else 0
+            ),
             'rushers_with_speed': sum((x['s'] > 2) & (x['distance_from_ball_x'] <= 5)),
             'rushers_accelerating': sum((x['a'] > 1) & (x['distance_from_ball_x'] <= 5))
         })
@@ -203,6 +213,9 @@ def create_enhanced_pressure_features(defensive_alignments, play_summary, plays_
     
     # Create feature interactions
     play_features = create_feature_interactions(play_features)
+    
+    # Fill any missing values in causedPressure with 0
+    play_features['causedPressure'] = play_features['causedPressure'].fillna(0)
     
     return play_features
 
