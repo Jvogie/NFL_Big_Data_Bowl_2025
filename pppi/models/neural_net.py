@@ -18,41 +18,33 @@ class PressureNet(nn.Module):
         self.input_norm = nn.BatchNorm1d(input_dim)
         
         self.block1 = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(input_dim, 256),
+            nn.BatchNorm1d(256),
             nn.LeakyReLU(0.2),
-            nn.Dropout(0.3)
+            nn.Dropout(0.5)
         )
         
         self.block2 = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.3)
-        )
-        
-        self.block3 = nn.Sequential(
             nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.LeakyReLU(0.2),
-            nn.Dropout(0.2)
+            nn.Dropout(0.5)
         )
         
-        # Attention mechanism
-        self.attention = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.Tanh(),
-            nn.Linear(64, 1),
-            nn.Softmax(dim=0)
-        )
-        
-        # Output layers
-        self.output = nn.Sequential(
+        self.block3 = nn.Sequential(
             nn.Linear(128, 64),
             nn.BatchNorm1d(64),
             nn.LeakyReLU(0.2),
-            nn.Dropout(0.1),
-            nn.Linear(64, 2)
+            nn.Dropout(0.4)
+        )
+        
+        # Output layers with strong regularization
+        self.output = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            nn.Linear(32, 2)
         )
         
         # Initialize weights
@@ -70,21 +62,13 @@ class PressureNet(nn.Module):
     
     def forward(self, x):
         x = self.input_norm(x)
-        
-        # Forward through blocks with residual connections
-        block1_out = self.block1(x)
-        block2_out = self.block2(block1_out)
-        block3_out = self.block3(block2_out)
-        
-        # Apply attention
-        attention_weights = self.attention(block3_out)
-        attended_features = block3_out * attention_weights
-        
-        # Output through final layers
-        return self.output(attended_features)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        return self.output(x)
 
 class PPPINeuralNet(PPPIBaseModel):
-    def __init__(self, input_dim=None, learning_rate=0.0005, batch_size=256, epochs=100):
+    def __init__(self, input_dim=None, learning_rate=0.0002, batch_size=128, epochs=50):
         super().__init__()
         self.input_dim = input_dim
         self.learning_rate = learning_rate
@@ -94,7 +78,7 @@ class PPPINeuralNet(PPPIBaseModel):
         self.model_ = None
         self.scaler = StandardScaler()
         self.classes_ = np.array([0, 1])
-        self.early_stopping_patience = 10
+        self.early_stopping_patience = 15
         self.best_val_loss = float('inf')
         self.patience_counter = 0
         
@@ -194,9 +178,9 @@ class PPPINeuralNet(PPPIBaseModel):
                 scheduler.step(epoch + batch_idx / len(train_loader))
                 
                 # Log training progress
-                if batch_idx % 10 == 0:
-                    current_lr = scheduler.get_last_lr()[0]
-                    print(f'Epoch {epoch+1}/{self.epochs} | Batch {batch_idx}/{len(train_loader)} | LR: {current_lr:.6f} | Loss: {loss.item():.4f}')
+                # if batch_idx % 10 == 0:
+                #     current_lr = scheduler.get_last_lr()[0]
+                #     print(f'Epoch {epoch+1}/{self.epochs} | Batch {batch_idx}/{len(train_loader)} | LR: {current_lr:.6f} | Loss: {loss.item():.4f}')
                 
                 train_loss += loss.item()
                 train_preds.extend(torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy())

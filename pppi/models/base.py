@@ -12,17 +12,17 @@ class PPPIBaseModel(BaseEstimator, ClassifierMixin):
     def __init__(self):
         self.model_ = None
     
-    def fit(self, X, y):
-        """Fit the model."""
+    def fit(self, X, y, **fit_params):
+        """Fit the model with optional parameters."""
         # Check that X and y have correct shape
         X, y = check_X_y(X, y)
         
         # Store the classes seen during fit
         self.classes_ = np.unique(y)
         
-        # Fit the underlying model
+        # Fit the underlying model with any additional parameters
         if hasattr(self, 'model_') and self.model_ is not None:
-            self.model_.fit(X, y)
+            self.model_.fit(X, y, **fit_params)
         
         return self
     

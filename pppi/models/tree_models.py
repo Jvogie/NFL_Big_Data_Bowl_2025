@@ -7,9 +7,10 @@ from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 from catboost import CatBoostClassifier
 from .base import PPPIBaseModel
+import numpy as np
 
 class PPPIRandomForest(PPPIBaseModel):
-    def __init__(self, n_estimators=300, max_depth=6, min_samples_leaf=10):
+    def __init__(self, n_estimators=2000, max_depth=3, min_samples_leaf=100):
         super().__init__()
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -21,13 +22,18 @@ class PPPIRandomForest(PPPIBaseModel):
             n_estimators=self.n_estimators,
             max_depth=self.max_depth,
             min_samples_leaf=self.min_samples_leaf,
-            class_weight='balanced_subsample',
-            random_state=42
+            min_samples_split=200,
+            max_features=0.5,
+            class_weight='balanced',
+            bootstrap=True,
+            oob_score=True,
+            random_state=42,
+            n_jobs=-1
         )
         return super().fit(X, y)
 
 class PPPIXGBoost(PPPIBaseModel):
-    def __init__(self, n_estimators=300, learning_rate=0.01, max_depth=4):
+    def __init__(self, n_estimators=2000, learning_rate=0.005, max_depth=3):
         super().__init__()
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
@@ -35,22 +41,31 @@ class PPPIXGBoost(PPPIBaseModel):
         self.model_ = None
     
     def fit(self, X, y):
+        neg_count = sum(y == 0)
+        pos_count = sum(y == 1)
+        scale_pos_weight = neg_count / pos_count
+        
         self.model_ = XGBClassifier(
             n_estimators=self.n_estimators,
             learning_rate=self.learning_rate,
             max_depth=self.max_depth,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=5,
-            scale_pos_weight=2,
-            reg_alpha=0.3,
-            reg_lambda=0.3,
-            random_state=42
+            subsample=0.6,
+            colsample_bytree=0.6,
+            min_child_weight=10,
+            gamma=0.2,
+            scale_pos_weight=scale_pos_weight,
+            reg_alpha=0.5,
+            reg_lambda=2,
+            tree_method='hist',
+            max_bin=64,
+            grow_policy='lossguide',
+            random_state=42,
+            n_jobs=-1
         )
         return super().fit(X, y)
 
 class PPPILightGBM(PPPIBaseModel):
-    def __init__(self, n_estimators=200, learning_rate=0.05, num_leaves=31):
+    def __init__(self, n_estimators=2000, learning_rate=0.005, num_leaves=16):
         super().__init__()
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
@@ -58,26 +73,33 @@ class PPPILightGBM(PPPIBaseModel):
         self.model_ = None
     
     def fit(self, X, y):
+        neg_count = sum(y == 0)
+        pos_count = sum(y == 1)
+        class_weight = {0: 1.0, 1: neg_count/pos_count}
+        
         self.model_ = LGBMClassifier(
             n_estimators=self.n_estimators,
             learning_rate=self.learning_rate,
             num_leaves=self.num_leaves,
-            max_depth=6,
-            min_child_samples=20,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_split_gain=1e-3,
-            min_child_weight=1e-3,
-            class_weight='balanced',
-            reg_alpha=0.1,
-            reg_lambda=0.1,
+            max_depth=3,
+            min_child_samples=50,
+            subsample=0.6,
+            colsample_bytree=0.6,
+            min_split_gain=0.1,
+            min_child_weight=5,
+            path_smooth=1,
+            extra_trees=True,
+            class_weight=class_weight,
+            reg_alpha=0.5,
+            reg_lambda=2,
             random_state=42,
+            n_jobs=-1,
             verbose=-1
         )
         return super().fit(X, y)
 
 class PPPICatBoost(PPPIBaseModel):
-    def __init__(self, iterations=500, learning_rate=0.02, depth=6):
+    def __init__(self, iterations=2000, learning_rate=0.005, depth=3):
         super().__init__()
         self.iterations = iterations
         self.learning_rate = learning_rate
@@ -89,11 +111,18 @@ class PPPICatBoost(PPPIBaseModel):
             iterations=self.iterations,
             learning_rate=self.learning_rate,
             depth=self.depth,
-            l2_leaf_reg=3,
+            l2_leaf_reg=5,
             bootstrap_type='Bernoulli',
-            subsample=0.8,
-            class_weights={0: 1, 1: 2},
+            subsample=0.6,
+            rsm=0.6,
+            min_data_in_leaf=50,
+            leaf_estimation_iterations=10,
+            random_strength=1,
+            auto_class_weights='Balanced',
             random_seed=42,
-            verbose=False
+            verbose=False,
+            allow_writing_files=False,
+            boost_from_average=True,
+            langevin=True
         )
         return super().fit(X, y) 
