@@ -73,14 +73,11 @@ class PPPIStackingEnsemble(PPPIBaseModel):
     def __init__(self, cv=5):
         super().__init__()
         self.cv = cv
-        # Initialize base models
         self.rf = PPPIRandomForest()
         self.xgb = PPPIXGBoost()
         self.lgb = PPPILightGBM()
         self.cat = PPPICatBoost()
-        if hasattr(self.cat.model_, 'set_params'):
-            self.cat.model_.set_params(logging_level='Silent', 
-                                     allow_writing_files=False)
+        # Use only the parameters that are defined in PPPILightGBM.__init__
         self.final_estimator = PPPILightGBM(
             n_estimators=500,
             learning_rate=0.005,
@@ -89,75 +86,27 @@ class PPPIStackingEnsemble(PPPIBaseModel):
         self.scaler = StandardScaler()
     
     def fit(self, X, y):
-        try:
-            # Scale features
-            X_scaled = self.scaler.fit_transform(X)
-            
-            # First fit base models individually
-            print("Fitting base models...")
-            self.rf.fit(X_scaled, y)
-            self.xgb.fit(X_scaled, y)
-            self.lgb.fit(X_scaled, y)
-            
-            # Initialize list of estimators
-            estimators = [
-                ('rf', self.rf.model_),
-                ('xgb', self.xgb.model_),
-                ('lgb', self.lgb.model_)
-            ]
-            
-            # Try to fit CatBoost
-            try:
-                print("Fitting CatBoost...")
-                self.cat.fit(X_scaled, y)
-                if self.cat.model_ is not None:
-                    estimators.append(('cat', self.cat.model_))
-            except Exception as e:
-                print(f"Warning: CatBoost fitting failed, continuing without it: {str(e)}")
-            
-            # Fit final estimator with conservative parameters
-            print("Fitting final estimator...")
-            self.final_estimator.fit(X_scaled, y)
-            
-            if self.final_estimator.model_ is None:
-                raise ValueError("Final estimator failed to fit")
-            
-            # Create and fit the stacking classifier
-            print("Creating stacking ensemble...")
-            self.model_ = StackingClassifier(
-                estimators=estimators,
-                final_estimator=self.final_estimator.model_,
-                cv=self.cv,
-                n_jobs=1,
-                verbose=0,
-                passthrough=True  # Added to include original features
-            )
-            
-            # Fit the stacking ensemble
-            print("Fitting stacking ensemble...")
-            return super().fit(X_scaled, y)
-            
-        except Exception as e:
-            print(f"Warning: Stacking ensemble failed: {str(e)}")
-            print("Falling back to voting ensemble...")
-            
-            # Create a simpler voting ensemble as fallback
-            estimators = []
-            if self.rf.model_ is not None:
-                estimators.append(('rf', self.rf.model_))
-            if self.xgb.model_ is not None:
-                estimators.append(('xgb', self.xgb.model_))
-            if self.lgb.model_ is not None:
-                estimators.append(('lgb', self.lgb.model_))
-            
-            if not estimators:
-                raise ValueError("No base models were successfully fitted")
-            
-            self.model_ = VotingClassifier(
-                estimators=estimators,
-                voting='soft'
-            )
-            return super().fit(X_scaled, y)
+        X_scaled = self.scaler.fit_transform(X)
+        self.rf.fit(X_scaled, y)
+        self.xgb.fit(X_scaled, y)
+        self.lgb.fit(X_scaled, y)
+        self.cat.fit(X_scaled, y)
+        
+        estimators = [
+            ('rf', self.rf.model_),
+            ('xgb', self.xgb.model_),
+            ('lgb', self.lgb.model_)
+        ]
+        
+        self.model_ = StackingClassifier(
+            estimators=estimators,
+            final_estimator=self.final_estimator.model_,
+            cv=self.cv,
+            n_jobs=-1,
+            passthrough=True
+        )
+        self.model_.fit(X_scaled, y)
+        return self
     
     def predict_proba(self, X):
         X_scaled = self.scaler.transform(X)

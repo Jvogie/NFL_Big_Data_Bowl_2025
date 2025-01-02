@@ -11,6 +11,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.feature_selection import RFE
 from imblearn.combine import SMOTETomek
+from imblearn.pipeline import Pipeline
 import shap
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -19,8 +20,22 @@ from pppi.models.tree_models import PPPIRandomForest, PPPIXGBoost, PPPILightGBM,
 from pppi.models.neural_net import PPPINeuralNet
 from pppi.models.ensemble import PPPIVotingEnsemble, PPPIStackingEnsemble
 
-def build_pressure_model(play_features):
-    """Build and evaluate multiple pressure prediction models."""
+def balance_data(X, y):
+    pipeline = Pipeline([
+        ('smote_tomek', SMOTETomek(random_state=42))
+    ])
+    X_balanced, y_balanced = pipeline.fit_resample(X, y)
+    return X_balanced, y_balanced
+
+def build_pressure_model(play_features, selected_models=None):
+    """Build and evaluate multiple pressure prediction models.
+    
+    Args:
+        play_features: DataFrame containing the features
+        selected_models: List of model names to train. If None, trains all models.
+                        Valid options: ['random_forest', 'xgboost', 'lightgbm', 
+                        'catboost', 'neural_net', 'voting', 'stacking']
+    """
     # Select features for model
     feature_columns = [col for col in play_features.columns 
                       if col not in ['gameId', 'playId', 'causedPressure']]
@@ -59,40 +74,57 @@ def build_pressure_model(play_features):
     )
     
     # Balance classes
-    smotetomek = SMOTETomek(random_state=42)
-    X_train_balanced, y_train_balanced = smotetomek.fit_resample(X_train_scaled, y_train)
+    X_balanced, y_balanced = balance_data(X_train_scaled, y_train)
     
     # Convert to DataFrame to preserve feature names
-    X_train_balanced = pd.DataFrame(X_train_balanced, columns=X_train_scaled.columns)
+    X_balanced = pd.DataFrame(X_balanced, columns=X_train_scaled.columns)
     
-    # Initialize models
-    models = {
-        'Random Forest': PPPIRandomForest(),
-        'XGBoost': PPPIXGBoost(),
-        'LightGBM': PPPILightGBM(),
-        'CatBoost': PPPICatBoost(),
-        'Neural Network': PPPINeuralNet(),
-        'Voting Ensemble': PPPIVotingEnsemble(),
-        'Stacking Ensemble': PPPIStackingEnsemble()
+    # Define all available models
+    all_models = {
+        'random_forest': ('Random Forest', PPPIRandomForest()),
+        'xgboost': ('XGBoost', PPPIXGBoost()),
+        'lightgbm': ('LightGBM', PPPILightGBM()),
+        'catboost': ('CatBoost', PPPICatBoost()),
+        'neural_net': ('Neural Network', PPPINeuralNet()),
+        'voting': ('Voting Ensemble', PPPIVotingEnsemble()),
+        'stacking': ('Stacking Ensemble', PPPIStackingEnsemble())
     }
+    
+    # Select models to train
+    if selected_models is None:
+        # Use all models except ensembles by default
+        selected_models = ['random_forest', 'xgboost', 'lightgbm', 'catboost', 'neural_net']
+    
+    # Validate selected models
+    invalid_models = set(selected_models) - set(all_models.keys())
+    if invalid_models:
+        raise ValueError(f"Invalid model selections: {invalid_models}. "
+                        f"Valid options are: {list(all_models.keys())}")
+    
+    # Initialize selected models
+    models = {all_models[name][0]: all_models[name][1] for name in selected_models}
     
     # Train and evaluate models
     results = {}
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
     
     for name, model in models.items():
         print(f"\n{name} Results:")
         
         # Cross-validation
+        # if needed this was working: cv=cv, scoring='roc_auc', n_jobs=-1
         cv_scores = cross_val_score(
-            model, X_train_balanced, y_train_balanced, 
-            cv=cv, scoring='roc_auc', n_jobs=-1
+            model, X_balanced, y_balanced, 
+            cv=cv, 
+            scoring='roc_auc', 
+            n_jobs=-1,
+            fit_params={'verbose': False}
         )
         print(f"Cross-validation ROC AUC scores: {cv_scores}")
         print(f"Mean CV ROC AUC: {cv_scores.mean():.3f} (+/- {cv_scores.std() * 2:.3f})")
         
         # Train final model
-        model.fit(X_train_balanced, y_train_balanced)
+        model.fit(X_balanced, y_balanced)
         
         # Evaluate
         y_pred = model.predict(X_test_scaled)
@@ -120,9 +152,9 @@ def build_pressure_model(play_features):
     # Analyze feature importance
     importance_analysis = analyze_feature_importance(
         best_model,
-        X_train_balanced,
+        X_balanced,
         X_test_scaled,
-        y_train_balanced,
+        y_balanced,
         y_test,
         feature_columns
     )
