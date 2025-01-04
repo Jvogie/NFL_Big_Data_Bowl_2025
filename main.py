@@ -1,5 +1,6 @@
 """
 Main script for running the PPPI analysis.
+
 """
 
 import matplotlib.pyplot as plt
@@ -20,7 +21,15 @@ from pppi.evaluation import (
     calculate_pppi
 )
 
-def main():
+def main(selected_models=None):
+    """
+    Main script for running the PPPI analysis.
+    
+    Args:
+        selected_models: List of model names to train. If None, trains default models.
+                        Valid options: ['random_forest', 'xgboost', 'lightgbm', 
+                        'catboost', 'neural_net', 'voting', 'stacking']
+    """
     # Use the default directory name where the data files are located
     data_dir = "nfl-big-data-bowl-2025"
     
@@ -77,7 +86,10 @@ def main():
     )
     
     # Build model and calculate PPPI
-    model, scaler, feature_cols, importance = build_pressure_model(enhanced_features)
+    model, scaler, feature_cols, importance = build_pressure_model(
+        enhanced_features,
+        selected_models=selected_models
+    )
     features_with_pppi = calculate_pppi(
         model, 
         scaler, 
@@ -89,4 +101,7 @@ def main():
     return features_with_pppi, model, importance
 
 if __name__ == "__main__":
-    features_with_pppi, model, importance = main() 
+    # Example: Select specific models to train
+    # selected_models = ['xgboost', 'lightgbm', 'neural_net']  # Uncomment and modify to select models
+    selected_models = ['catboost'] # Train default models
+    features_with_pppi, model, importance = main(selected_models) 
