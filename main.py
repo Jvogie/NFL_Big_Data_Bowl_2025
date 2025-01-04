@@ -103,5 +103,5 @@ def main(selected_models=None):
 if __name__ == "__main__":
     # Example: Select specific models to train
     # selected_models = ['xgboost', 'lightgbm', 'neural_net']  # Uncomment and modify to select models
-    selected_models = ['xgboost']  # Train default models
+    selected_models = ['catboost'] # Train default models
     features_with_pppi, model, importance = main(selected_models) 

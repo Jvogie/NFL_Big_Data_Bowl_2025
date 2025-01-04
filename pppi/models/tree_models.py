@@ -77,8 +77,6 @@ class PPPIXGBoost(PPPIBaseModel):
         # Train model with optimized parameters
         self.model_ = XGBClassifier(**params)
         self.model_.fit(X, y)
-
-        
         
         return self
     

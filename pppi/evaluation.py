@@ -57,27 +57,25 @@ def build_pressure_model(play_features, selected_models=None):
         print("\nNaN values found in features:")
         print(nan_cols[nan_cols > 0])
     
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    # Scale features while preserving feature names
+    # Scale all data first
     scaler = StandardScaler()
-    X_train_scaled = pd.DataFrame(
-        scaler.fit_transform(X_train),
-        columns=X_train.columns,
-        index=X_train.index
-    )
-    X_test_scaled = pd.DataFrame(
-        scaler.transform(X_test),
-        columns=X_test.columns,
-        index=X_test.index
+    X_scaled = pd.DataFrame(
+        scaler.fit_transform(X),
+        columns=X.columns
     )
     
-    # Balance classes
-    X_balanced, y_balanced = balance_data(X_train_scaled, y_train)
+    # Split after scaling to avoid data leakage
+    X_train_scaled, X_test_scaled, y_train, y_test = train_test_split(
+        X_scaled, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    # Balance both training and test sets
+    X_train_balanced, y_train_balanced = balance_data(X_train_scaled, y_train)
+    X_test_balanced, y_test_balanced = balance_data(X_test_scaled, y_test)
     
     # Convert to DataFrame to preserve feature names
-    X_balanced = pd.DataFrame(X_balanced, columns=X_train_scaled.columns)
+    X_train_balanced = pd.DataFrame(X_train_balanced, columns=X_train_scaled.columns)
+    X_test_balanced = pd.DataFrame(X_test_balanced, columns=X_test_scaled.columns)
     
     # Define all available models
     all_models = {
@@ -93,7 +91,7 @@ def build_pressure_model(play_features, selected_models=None):
     # Select models to train
     if selected_models is None:
         # Use all models except ensembles by default
-        selected_models = ['random_forest', 'xgboost', 'lightgbm', 'catboost', 'neural_net']
+        selected_models = ['random_forest', 'xgboost', 'lightgbm', 'catboost', 'neural_net', 'voting']
     
     # Validate selected models
     invalid_models = set(selected_models) - set(all_models.keys())
@@ -111,28 +109,24 @@ def build_pressure_model(play_features, selected_models=None):
     for name, model in models.items():
         print(f"\n{name} Results:")
         
-        # Cross-validation
-        # if needed this was working: cv=cv, scoring='roc_auc', n_jobs=-1
+        # Cross-validation on balanced training data
         cv_scores = cross_val_score(
-            model, X_balanced, y_balanced, 
-            cv=cv, 
-            scoring='roc_auc', 
-            n_jobs=-1,
-            fit_params={'verbose': False}
+            model, X_train_balanced, y_train_balanced, 
+            cv=cv, scoring='roc_auc', n_jobs=-1
         )
         print(f"Cross-validation ROC AUC scores: {cv_scores}")
         print(f"Mean CV ROC AUC: {cv_scores.mean():.3f} (+/- {cv_scores.std() * 2:.3f})")
         
-        # Train final model
-        model.fit(X_balanced, y_balanced)
+        # Train final model on full balanced training data
+        model.fit(X_train_balanced, y_train_balanced)
         
-        # Evaluate
-        y_pred = model.predict(X_test_scaled)
-        y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
-        roc_auc = roc_auc_score(y_test, y_pred_proba)
+        # Evaluate on balanced test set
+        y_pred = model.predict(X_test_balanced)
+        y_pred_proba = model.predict_proba(X_test_balanced)[:, 1]
+        roc_auc = roc_auc_score(y_test_balanced, y_pred_proba)
         
         print("\nClassification Report:")
-        print(classification_report(y_test, y_pred))
+        print(classification_report(y_test_balanced, y_pred))
         print(f"ROC AUC Score: {roc_auc:.3f}")
         
         results[name] = {
@@ -152,10 +146,10 @@ def build_pressure_model(play_features, selected_models=None):
     # Analyze feature importance
     importance_analysis = analyze_feature_importance(
         best_model,
-        X_balanced,
-        X_test_scaled,
-        y_balanced,
-        y_test,
+        X_train_balanced,
+        X_test_balanced,
+        y_train_balanced,
+        y_test_balanced,
         feature_columns
     )
     
