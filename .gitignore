@@ -46,7 +46,7 @@ local_settings.py
 db.sqlite3
 
 # Project specific
-*.png
+
 *.csv
 *.jpg
 *.jpeg
