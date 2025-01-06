@@ -125,7 +125,7 @@ class PPPILightGBM(PPPIBaseModel):
         return super().fit(X, y)
 
 class PPPICatBoost(PPPIBaseModel):
-    def __init__(self, iterations=2000, learning_rate=0.005, depth=3):
+    def __init__(self, iterations=5000, learning_rate=0.005, depth=3):
         super().__init__()
         self.iterations = iterations
         self.learning_rate = learning_rate

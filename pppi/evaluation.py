@@ -2,23 +2,32 @@
 Model evaluation and analysis functions for PPPI.
 """
 
+import matplotlib
+matplotlib.use('Agg')  # Set the backend before importing pyplot
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import classification_report, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.feature_selection import RFE
 from imblearn.combine import SMOTETomek
 from imblearn.pipeline import Pipeline
 import shap
-import matplotlib.pyplot as plt
 import seaborn as sns
 
 from pppi.models.tree_models import PPPIRandomForest, PPPIXGBoost, PPPILightGBM, PPPICatBoost
 from pppi.models.neural_net import PPPINeuralNet
 from pppi.models.ensemble import PPPIVotingEnsemble, PPPIStackingEnsemble
+from pppi.visualization import (
+    plot_roc_curves,
+    plot_feature_importance_comparison,
+    plot_pppi_distribution,
+    plot_play_alignment,
+    find_extreme_pppi_plays
+)
 
 def balance_data(X, y):
     pipeline = Pipeline([
@@ -91,7 +100,7 @@ def build_pressure_model(play_features, selected_models=None):
     # Select models to train
     if selected_models is None:
         # Use all models except ensembles by default
-        selected_models = ['random_forest', 'xgboost', 'lightgbm', 'catboost', 'neural_net', 'voting']
+        selected_models = ['random_forest', 'xgboost', 'lightgbm', 'catboost', 'neural_net']
     
     # Validate selected models
     invalid_models = set(selected_models) - set(all_models.keys())
@@ -134,8 +143,57 @@ def build_pressure_model(play_features, selected_models=None):
             'roc_auc': roc_auc,
             'predictions': y_pred,
             'probabilities': y_pred_proba,
-            'cv_scores': cv_scores
+            'cv_scores': cv_scores,
+            'cv_mean': cv_scores.mean(),
+            'cv_std': cv_scores.std()
         }
+    
+    # Create visualizations using pre-computed results
+    model_results = {name: results[name]['model'] for name in results}
+    
+    # Plot ROC curves using test predictions we already have
+    plot_roc_curves({name: results[name]['model'] for name in results}, 
+                   X_test_balanced, y_test_balanced)
+    plt.savefig('roc_curves.png')
+    plt.close()
+
+    # Create comparison table using pre-computed metrics
+    comparison_data = []
+    for name in results:
+        comparison_data.append({
+            'Model': name,
+            'Train ROC AUC': results[name]['cv_mean'],
+            'Train Std Dev': results[name]['cv_std'],
+            'Test ROC AUC': results[name]['roc_auc']
+        })
+    comparison_table = pd.DataFrame(comparison_data).round(3)
+    print("\nModel Comparison Table:")
+    print(comparison_table)
+
+    # If CatBoost and XGBoost are both present, compare them using pre-computed predictions
+    if 'CatBoost' in results and 'XGBoost' in results:
+        cat_results = results['CatBoost']
+        xgb_results = results['XGBoost']
+        top_model_comparison = pd.DataFrame([
+            {
+                'Model': 'CatBoost',
+                'Accuracy': accuracy_score(y_test_balanced, cat_results['predictions']),
+                'Precision': precision_score(y_test_balanced, cat_results['predictions']),
+                'Recall': recall_score(y_test_balanced, cat_results['predictions']),
+                'F1 Score': f1_score(y_test_balanced, cat_results['predictions']),
+                'ROC AUC': cat_results['roc_auc']
+            },
+            {
+                'Model': 'XGBoost',
+                'Accuracy': accuracy_score(y_test_balanced, xgb_results['predictions']),
+                'Precision': precision_score(y_test_balanced, xgb_results['predictions']),
+                'Recall': recall_score(y_test_balanced, xgb_results['predictions']),
+                'F1 Score': f1_score(y_test_balanced, xgb_results['predictions']),
+                'ROC AUC': xgb_results['roc_auc']
+            }
+        ]).round(3)
+        print("\nTop Models Detailed Comparison:")
+        print(top_model_comparison)
     
     # Select best model
     best_model_name = max(results, key=lambda x: results[x]['roc_auc'])
@@ -199,6 +257,8 @@ def analyze_feature_importance(model, X_train, X_test, y_train, y_test, feature_
             shap.summary_plot(shap_values, X_test, feature_names=feature_names, show=False)
             plt.title('SHAP Feature Importance')
             plt.tight_layout()
+            plt.savefig('shap_summary.png')
+            plt.close()
             
         except Exception as e:
             print(f"Warning: SHAP analysis failed: {e}")
@@ -210,7 +270,7 @@ def analyze_feature_importance(model, X_train, X_test, y_train, y_test, feature_
         base_rf.fit(X_train[:100], y_train[:100])  # Fit on a small subset for initialization
         
         rfe = RFE(
-            estimator=base_rf.model_,  # Use model_ instead of model
+            estimator=base_rf.model_,
             n_features_to_select=20
         )
         
@@ -226,6 +286,15 @@ def analyze_feature_importance(model, X_train, X_test, y_train, y_test, feature_
     except Exception as e:
         print(f"Warning: RFE analysis failed: {e}")
         print("Continuing with other importance metrics...")
+    
+    # Create feature importance comparison plot
+    plot_feature_importance_comparison(
+        importance_results.get('shap', pd.DataFrame()),
+        importance_results.get('permutation', pd.DataFrame()),
+        importance_results.get('rfe', pd.DataFrame())
+    )
+    plt.savefig('feature_importance_comparison.png')
+    plt.close()
     
     # Print summary
     print("\nTop 10 Most Important Features (Permutation Importance):")
@@ -284,13 +353,16 @@ def calculate_pppi(model, scaler, feature_columns, play_features):
     # Calculate PPPI
     pppi = model.predict_proba(X_scaled)[:, 1]
     
+    # Convert pppi to pandas Series for easier manipulation
+    pppi_series = pd.Series(pppi, index=X.index)
+    
     # Add PPPI to features
     play_features_with_pppi = play_features.copy()
-    play_features_with_pppi['pppi'] = pppi
+    play_features_with_pppi['pppi'] = pppi_series
     
     # Calculate quartiles
     play_features_with_pppi['pppi_quartile'] = pd.qcut(
-        pppi, 
+        pppi_series, 
         q=4, 
         labels=['Q1', 'Q2', 'Q3', 'Q4'],
         duplicates='drop'
@@ -298,7 +370,7 @@ def calculate_pppi(model, scaler, feature_columns, play_features):
     
     # Print distribution statistics
     print("\nPPPI Distribution:")
-    print(pd.Series(pppi).describe())
+    print(pppi_series.describe())
     
     # Analyze pressure rate by quartile with explicit observed parameter
     pressure_by_quartile = play_features_with_pppi.groupby(
@@ -308,4 +380,72 @@ def calculate_pppi(model, scaler, feature_columns, play_features):
     print("\nPressure Rate by PPPI Quartile:")
     print(pressure_by_quartile)
     
+    # Create PPPI distribution plot
+    quartiles = {
+        1: pppi_series.quantile(0.25),
+        2: pppi_series.quantile(0.50),
+        3: pppi_series.quantile(0.75)
+    }
+    
+    plot_pppi_distribution(
+        pppi_series,
+        play_features_with_pppi['causedPressure'],
+        quartiles
+    )
+    plt.savefig('pppi_distribution.png')
+    plt.close()
+    
     return play_features_with_pppi 
+
+def analyze_extreme_plays(play_features_with_pppi, tracking_data, plays_df):
+    """
+    Analyze and visualize plays with extreme (high/low) PPPI scores.
+    
+    Args:
+        play_features_with_pppi: DataFrame containing plays with PPPI scores
+        tracking_data: DataFrame containing tracking data
+        plays_df: DataFrame containing play information
+    """
+    # Find extreme plays
+    low_pppi_plays, high_pppi_plays = find_extreme_pppi_plays(play_features_with_pppi, n_plays=1)
+    
+    # Get play details
+    for play_type, plays in [('Low', low_pppi_plays), ('High', high_pppi_plays)]:
+        for _, play in plays.iterrows():
+            # Get play info
+            play_info = plays_df[
+                (plays_df['gameId'] == play['gameId']) & 
+                (plays_df['playId'] == play['playId'])
+            ].iloc[0]
+            
+            # Get tracking data for this play
+            play_tracking = tracking_data[
+                (tracking_data['gameId'] == play['gameId']) & 
+                (tracking_data['playId'] == play['playId'])
+            ]
+            
+            # Create visualization
+            plot_play_alignment(
+                play_tracking,
+                play_info,
+                pppi_score=play['pppi'],
+                title=f"{play_type} PPPI Play Example"
+            )
+            plt.savefig(f'{play_type.lower()}_pppi_play.png')
+            plt.close()
+            
+            # Print play details
+            print(f"\n{play_type} PPPI Play Details:")
+            print(f"PPPI Score: {play['pppi']:.3f}")
+            print(f"Game ID: {play['gameId']}")
+            print(f"Play ID: {play['playId']}")
+            print(f"Teams: {play_info['possessionTeam']} vs {play_info['defensiveTeam']}")
+            print(f"Play Description: {play_info['playDescription']}")
+            print("\nKey Features:")
+            # Print top 5 most important features for this play
+            feature_cols = [col for col in play.index if col not in ['gameId', 'playId', 'pppi', 'pppi_quartile', 'causedPressure']]
+            features_df = pd.DataFrame({
+                'Feature': feature_cols,
+                'Value': [play[col] for col in feature_cols]
+            }).sort_values('Value', ascending=False)
+            print(features_df.head().to_string())

@@ -3,6 +3,8 @@ Main script for running the PPPI analysis.
 
 """
 
+import matplotlib
+matplotlib.use('Agg')  # Set the backend before importing pyplot
 import matplotlib.pyplot as plt
 from pppi.data_loading import (
     load_tracking_data,
@@ -18,7 +20,8 @@ from pppi.feature_engineering import (
 )
 from pppi.evaluation import (
     build_pressure_model,
-    calculate_pppi
+    calculate_pppi,
+    analyze_extreme_plays
 )
 
 def main(selected_models=None):
@@ -97,11 +100,13 @@ def main(selected_models=None):
         enhanced_features
     )
     
-    plt.show()
+    # Analyze and visualize extreme plays
+    analyze_extreme_plays(features_with_pppi, pre_snap_data, plays_df)
+    
     return features_with_pppi, model, importance
 
 if __name__ == "__main__":
-    # Example: Select specific models to train
-    # selected_models = ['xgboost', 'lightgbm', 'neural_net']  # Uncomment and modify to select models
-    selected_models = ['catboost'] # Train default models
+    # Select specific models to train
+    # Example: selected_models = ['xgboost', 'lightgbm', 'neural_net'] 
+    selected_models = None
     features_with_pppi, model, importance = main(selected_models) 
