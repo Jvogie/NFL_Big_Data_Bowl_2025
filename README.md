@@ -48,6 +48,7 @@ pip install -r requirements.txt
 1. Prepare your data:
    - Ensure you have the NFL tracking data in the correct format
    - Data should include pre-snap frames and player tracking information
+   - The data I used can be found [here](https://www.kaggle.com/competitions/nfl-big-data-bowl-2025)
 
 2. Run the main script:
 ```bash
