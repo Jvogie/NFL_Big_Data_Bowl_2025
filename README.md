@@ -12,6 +12,8 @@ This project introduces the Pre-snap Pressure Prediction Index (PPPI), a novel m
 - Multiple model comparison (XGBoost, CatBoost, etc.)
 - Visualization tools for play analysis
 
+Link to Kaggle Notebook that was submitted with detailed explanation of the project: https://www.kaggle.com/code/jackvogelgesang/nfl-data-bowl-2025-pppi-metric-track
+
 ## Project Structure
 ```
 NFL_Big_Data_Bowl_2025/
